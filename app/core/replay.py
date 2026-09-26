@@ -15,6 +15,12 @@ from .clock import (
     to_utc,
     union_seconds,
 )
+from .qualifications import (
+    PinnedQualification,
+    QualifierInput,
+    RetroApproval,
+    resolve_checkin,
+)
 
 
 class EventType(StrEnum):
@@ -52,6 +58,9 @@ class CheckinRecord:
     start_utc: datetime
     end_utc: datetime
     status: CheckinStatus
+    pending_reasons: list[str] = field(default_factory=list)
+    qualification: PinnedQualification | None = None
+    retro_approval: RetroApproval | None = None
 
     @property
     def seconds(self) -> int:
@@ -127,6 +136,7 @@ def replay(
     timezone_name: str,
     required_seconds: int,
     up_to_event_id: str | None = None,
+    qualifier: QualifierInput | None = None,
 ) -> ReplayState:
     """执行确定性的业务处理。"""
     sorted_events = sorted(
@@ -138,6 +148,7 @@ def replay(
 
     checkins_by_student: dict[str, list[CheckinRecord]] = {}
     checkin_index: dict[str, CheckinRecord] = {}
+    mentor_confirmed_ids: set[str] = set()
     adjustments_by_student: dict[str, list[Adjustment]] = {}
 
     for event in sorted_events:
@@ -149,7 +160,7 @@ def replay(
             target_id = event.payload.get("checkin_event_id")
             target = checkin_index.get(target_id)
             if target is not None and target.student_id == event.student_id:
-                target.status = CheckinStatus.CONFIRMED
+                mentor_confirmed_ids.add(target_id)
         elif event.event_type == EventType.LEAVE_CORRECTION:
             seconds = int(event.payload.get("adjustment_seconds", 0))
             adjustments_by_student.setdefault(event.student_id, []).append(
@@ -160,6 +171,32 @@ def replay(
                     reason=str(event.payload.get("reason", "")),
                 )
             )
+
+    # 固定的资格快照与追溯决定在重放时决定每条签到的最终状态。
+    for student_id, records in checkins_by_student.items():
+        for record in records:
+            pinned = qualifier.pinned.get(record.event_id) if qualifier else None
+            approval = (
+                qualifier.approvals.get(record.event_id) if qualifier else None
+            )
+            current_complete = (
+                qualifier.current_complete.get(record.event_id)
+                if qualifier
+                else None
+            )
+            counts, reasons = resolve_checkin(
+                activity_type=record.activity_type,
+                mentor_confirmed=record.event_id in mentor_confirmed_ids,
+                pinned=pinned,
+                current_complete=current_complete,
+                approval=approval,
+            )
+            record.status = (
+                CheckinStatus.CONFIRMED if counts else CheckinStatus.PENDING
+            )
+            record.pending_reasons = reasons
+            record.qualification = pinned
+            record.retro_approval = approval
 
     all_students = set(checkins_by_student) | set(adjustments_by_student)
     students: dict[str, StudentProgress] = {}
@@ -222,12 +259,13 @@ def replay(
 def explain_checkin(record: CheckinRecord, tz_name: str) -> dict[str, Any]:
     """执行确定性的业务处理。"""
     segments = split_by_academic_day(record.start_utc, record.end_utc, tz_name)
-    return {
+    explanation = {
         "event_id": record.event_id,
         "activity_id": record.activity_id,
         "activity_type": record.activity_type,
         "status": record.status.value,
         "counts": record.counts,
+        "pending_reasons": list(record.pending_reasons),
         "check_in_at_utc": record.start_utc.astimezone(timezone.utc)
         .isoformat()
         .replace("+00:00", "Z"),
@@ -245,3 +283,12 @@ def explain_checkin(record: CheckinRecord, tz_name: str) -> dict[str, Any]:
             for day, seg_start, seg_end in segments
         ],
     }
+    if record.qualification is not None:
+        explanation["qualification"] = record.qualification.to_dict()
+    else:
+        explanation["qualification"] = None
+    if record.retro_approval is not None:
+        explanation["retro_approval"] = record.retro_approval.to_dict()
+    else:
+        explanation["retro_approval"] = None
+    return explanation

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from .qualifications import QualifierInput
 from .replay import (
     CheckinRecord,
     Event,
@@ -85,6 +86,7 @@ def build_snapshot(
     freeze_id: str | None = None,
     event_cutoff_id: str | None = None,
     generated_at: datetime | None = None,
+    qualifier: QualifierInput | None = None,
 ) -> Snapshot:
     """执行确定性的业务处理。"""
     state: ReplayState = replay(
@@ -93,6 +95,7 @@ def build_snapshot(
         timezone_name=timezone_name,
         required_seconds=required_seconds,
         up_to_event_id=event_cutoff_id,
+        qualifier=qualifier,
     )
     if generated_at is None:
         generated_at = datetime.now(timezone.utc)

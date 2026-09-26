@@ -75,6 +75,7 @@ class ImportResult(BaseModel):
     accepted: int
     duplicates: list[str]
     rejected: list[dict[str, Any]]
+    qualifications: list[dict[str, Any]] = []
 
 
 class DailyTotal(BaseModel):
@@ -88,10 +89,13 @@ class CheckinExplanation(BaseModel):
     activity_type: str
     status: str
     counts: bool
+    pending_reasons: list[str] = []
     check_in_at_utc: str
     check_out_at_utc: str
     raw_seconds: int
     academic_days: list[dict[str, Any]]
+    qualification: dict[str, Any] | None = None
+    retro_approval: dict[str, Any] | None = None
 
 
 class AdjustmentOut(BaseModel):
@@ -138,3 +142,93 @@ class DiffOut(BaseModel):
     new_event_cutoff_id: str | None
     student_changes: list[dict[str, Any]]
     students_affected: int
+
+
+# ---------------------------------------------------------------------------
+# 合同与资格
+# ---------------------------------------------------------------------------
+
+MaterialTypeName = Literal["insurance", "nda", "safety_training"]
+
+
+class ContractIn(BaseModel):
+    contract_version: str = Field(..., min_length=1, max_length=128)
+    required_types: list[MaterialTypeName] = Field(..., min_length=1)
+
+
+class ContractOut(BaseModel):
+    plan_version: str
+    contract_version: str
+    required_types: list[str]
+    created_at: str
+
+
+class MaterialIn(BaseModel):
+    student_id: str = Field(..., min_length=1, max_length=128)
+    material_type: MaterialTypeName
+    version: int = Field(..., ge=1)
+    valid_from: datetime
+    valid_to: datetime
+    registered_by: str = Field(..., min_length=1, max_length=128)
+    note: str = Field("", max_length=512)
+
+    @model_validator(mode="after")
+    def _check_order(self) -> "MaterialIn":
+        if self.valid_to <= self.valid_from:
+            raise ValueError("valid_to must be after valid_from")
+        return self
+
+    @field_validator("valid_from", "valid_to")
+    @classmethod
+    def _ensure_aware(cls, v: datetime) -> datetime:
+        if v.tzinfo is None:
+            raise ValueError("timestamps must be timezone-aware (RFC 3339)")
+        return v
+
+
+class MaterialOut(BaseModel):
+    id: int
+    student_id: str
+    material_type: str
+    version: int
+    valid_from: str
+    valid_to: str
+    status: str
+    registered_by: str
+    note: str
+
+
+class RevokeIn(BaseModel):
+    revoked_by: str = Field(..., min_length=1, max_length=128)
+    reason: str = Field("", max_length=512)
+
+
+class QualificationEvaluationOut(BaseModel):
+    plan_version: str
+    event_id: str
+    student_id: str
+    contract_registered: bool
+    pinned_at_event: dict[str, Any] | None
+    current_evaluation: dict[str, Any]
+    replay: dict[str, Any] | None
+    case: dict[str, Any] | None
+
+
+class CaseDecisionIn(BaseModel):
+    approved: bool
+    actor_id: str = Field(..., min_length=1, max_length=128)
+    actor_role: Literal["compliance_officer", "admin", "mentor", "student"]
+    reason: str = Field("", max_length=512)
+    gap_acknowledged: bool = False
+
+
+class CaseOut(BaseModel):
+    plan_version: str
+    case_id: str
+    checkin_event_id: str
+    student_id: str
+    status: str
+    snapshot: dict[str, Any]
+    decision: dict[str, Any] | None
+    created_at: str
+    updated_at: str
