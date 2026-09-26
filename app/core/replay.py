@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from .clock import (
     academic_day,
@@ -14,6 +14,10 @@ from .clock import (
     split_by_academic_day,
     to_utc,
     union_seconds,
+)
+from .eligibility import (
+    RETRO_APPROVED,
+    Admission,
 )
 
 
@@ -52,6 +56,11 @@ class CheckinRecord:
     start_utc: datetime
     end_utc: datetime
     status: CheckinStatus
+    blocked: bool = False
+    admission_status: str | None = None
+    admission_missing: tuple[str, ...] = ()
+    contract_version: str | None = None
+    retroactive: str | None = None
 
     @property
     def seconds(self) -> int:
@@ -100,7 +109,9 @@ class ReplayState:
 
 
 def _parse_checkin(
-    event: Event, tz_name: str
+    event: Event,
+    tz_name: str,
+    admissions: Mapping[str, Admission] | None = None,
 ) -> CheckinRecord:
     start = to_utc(datetime.fromisoformat(event.payload["check_in_at"]))
     end = to_utc(datetime.fromisoformat(event.payload["check_out_at"]))
@@ -109,7 +120,7 @@ def _parse_checkin(
     status = (
         CheckinStatus.PENDING if requires_confirmation else CheckinStatus.CONFIRMED
     )
-    return CheckinRecord(
+    record = CheckinRecord(
         event_id=event.event_id,
         student_id=event.student_id,
         activity_id=event.payload.get("activity_id", ""),
@@ -118,6 +129,22 @@ def _parse_checkin(
         end_utc=end,
         status=status,
     )
+    # 事件发生时固定的前置条件快照：缺项签到保留为待定（而非丢弃），
+    # 且导师确认也无法解除该阻塞，只能由追溯审批决定。
+    admission = (admissions or {}).get(event.event_id)
+    if admission is not None:
+        record.admission_status = admission.status
+        record.admission_missing = tuple(admission.missing)
+        record.contract_version = admission.contract_version
+        record.retroactive = admission.retroactive
+        if admission.blocking and admission.status == "deficient":
+            record.blocked = True
+            record.status = CheckinStatus.PENDING
+            if admission.retroactive == RETRO_APPROVED:
+                # 授权人确认追溯计入；原始资格快照仍保留用于审计。
+                record.blocked = False
+                record.status = CheckinStatus.CONFIRMED
+    return record
 
 
 def replay(
@@ -127,6 +154,7 @@ def replay(
     timezone_name: str,
     required_seconds: int,
     up_to_event_id: str | None = None,
+    admissions: Mapping[str, Admission] | None = None,
 ) -> ReplayState:
     """执行确定性的业务处理。"""
     sorted_events = sorted(
@@ -142,13 +170,18 @@ def replay(
 
     for event in sorted_events:
         if event.event_type == EventType.CHECKIN:
-            record = _parse_checkin(event, timezone_name)
+            record = _parse_checkin(event, timezone_name, admissions)
             checkins_by_student.setdefault(event.student_id, []).append(record)
             checkin_index[event.event_id] = record
         elif event.event_type == EventType.MENTOR_CONFIRM:
             target_id = event.payload.get("checkin_event_id")
             target = checkin_index.get(target_id)
-            if target is not None and target.student_id == event.student_id:
+            # 前置条件缺项的签到只能通过追溯审批解除，导师确认无效。
+            if (
+                target is not None
+                and target.student_id == event.student_id
+                and not target.blocked
+            ):
                 target.status = CheckinStatus.CONFIRMED
         elif event.event_type == EventType.LEAVE_CORRECTION:
             seconds = int(event.payload.get("adjustment_seconds", 0))
@@ -222,7 +255,7 @@ def replay(
 def explain_checkin(record: CheckinRecord, tz_name: str) -> dict[str, Any]:
     """执行确定性的业务处理。"""
     segments = split_by_academic_day(record.start_utc, record.end_utc, tz_name)
-    return {
+    explanation: dict[str, Any] = {
         "event_id": record.event_id,
         "activity_id": record.activity_id,
         "activity_type": record.activity_type,
@@ -245,3 +278,20 @@ def explain_checkin(record: CheckinRecord, tz_name: str) -> dict[str, Any]:
             for day, seg_start, seg_end in segments
         ],
     }
+    if record.admission_status is not None:
+        # 说明该签到为何被保留为待定（资格缺项）或如何被追溯计入。
+        if record.blocked:
+            hold_reason = "missing_prerequisites"
+        elif record.retroactive == RETRO_APPROVED:
+            hold_reason = "retroactively_approved"
+        else:
+            hold_reason = "prerequisites_satisfied"
+        explanation["admission"] = {
+            "status": record.admission_status,
+            "blocking": record.blocked,
+            "contract_version": record.contract_version,
+            "missing_requirements": list(record.admission_missing),
+            "retroactive": record.retroactive,
+            "hold_reason": hold_reason,
+        }
+    return explanation

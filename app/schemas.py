@@ -55,6 +55,16 @@ class EventIn(BaseModel):
     student_id: str = Field(..., min_length=1, max_length=128)
     payload: dict[str, Any]
 
+    @model_validator(mode="after")
+    def _validate_payload(self) -> "EventIn":
+        model = {
+            "checkin": CheckinPayload,
+            "mentor_confirm": MentorConfirmPayload,
+            "leave_correction": LeaveCorrectionPayload,
+        }[self.event_type]
+        model.model_validate(self.payload)
+        return self
+
 
 class EventBatchIn(BaseModel):
     events: list[EventIn]
@@ -75,11 +85,21 @@ class ImportResult(BaseModel):
     accepted: int
     duplicates: list[str]
     rejected: list[dict[str, Any]]
+    admissions_captured: list[str] = []
 
 
 class DailyTotal(BaseModel):
     academic_day: str
     seconds: int
+
+
+class AdmissionExplanation(BaseModel):
+    status: str
+    blocking: bool
+    contract_version: str | None
+    missing_requirements: list[str]
+    retroactive: str | None
+    hold_reason: str
 
 
 class CheckinExplanation(BaseModel):
@@ -92,6 +112,7 @@ class CheckinExplanation(BaseModel):
     check_out_at_utc: str
     raw_seconds: int
     academic_days: list[dict[str, Any]]
+    admission: AdmissionExplanation | None = None
 
 
 class AdjustmentOut(BaseModel):
@@ -138,3 +159,153 @@ class DiffOut(BaseModel):
     new_event_cutoff_id: str | None
     student_changes: list[dict[str, Any]]
     students_affected: int
+
+
+# ---------------------------------------------------------------------------
+# 合同 / 前置材料 / 资格 / 追溯审批
+# ---------------------------------------------------------------------------
+
+
+class ContractIn(BaseModel):
+    contract_version: str = Field(..., min_length=1, max_length=128)
+    enterprise_id: str = Field(..., min_length=1, max_length=128)
+    required_documents: list[Literal[
+        "insurance",
+        "confidentiality_agreement",
+        "safety_training",
+    ]] = Field(..., min_length=1)
+    created_by: str = Field(..., min_length=1, max_length=128)
+
+
+class ContractOut(BaseModel):
+    plan_version: str
+    contract_version: str
+    enterprise_id: str
+    required_documents: list[str]
+    created_by: str
+    created_at: str
+
+
+class MaterialIn(BaseModel):
+    student_id: str = Field(..., min_length=1, max_length=128)
+    requirement: Literal[
+        "insurance",
+        "confidentiality_agreement",
+        "safety_training",
+    ]
+    document_ref: str = Field(..., min_length=1, max_length=256)
+    valid_from: datetime
+    valid_to: datetime | None = None
+    registered_by: str = Field(..., min_length=1, max_length=128)
+
+    @model_validator(mode="after")
+    def _check_window(self) -> "MaterialIn":
+        if self.valid_from.tzinfo is None:
+            raise ValueError("valid_from 必须是带时区的时间")
+        if self.valid_to is not None:
+            if self.valid_to.tzinfo is None:
+                raise ValueError("valid_to 必须是带时区的时间")
+            if self.valid_to <= self.valid_from:
+                raise ValueError("valid_to 必须晚于 valid_from")
+        return self
+
+
+class SupplementIn(BaseModel):
+    document_ref: str = Field(..., min_length=1, max_length=256)
+    valid_from: datetime
+    valid_to: datetime | None = None
+    actor_id: str = Field(..., min_length=1, max_length=128)
+
+    @model_validator(mode="after")
+    def _check_window(self) -> "SupplementIn":
+        if self.valid_from.tzinfo is None:
+            raise ValueError("valid_from 必须是带时区的时间")
+        if self.valid_to is not None:
+            if self.valid_to.tzinfo is None:
+                raise ValueError("valid_to 必须是带时区的时间")
+            if self.valid_to <= self.valid_from:
+                raise ValueError("valid_to 必须晚于 valid_from")
+        return self
+
+
+class MaterialOut(BaseModel):
+    material_id: int
+    plan_version: str
+    student_id: str
+    requirement: str
+    document_ref: str
+    valid_from: str
+    valid_to: str | None
+    status: str
+    version: int
+    supersedes_id: int | None
+    registered_by: str
+    created_at: str
+    updated_at: str
+
+
+class SupplementOut(BaseModel):
+    supplemented: MaterialOut
+    previous: MaterialOut
+
+
+class RevokeIn(BaseModel):
+    expected_version: int = Field(..., ge=1)
+    actor_id: str = Field(..., min_length=1, max_length=128)
+
+
+class EligibilityRequirement(BaseModel):
+    requirement: str
+    status: str
+    material: dict[str, Any] | None
+
+
+class EligibilityOut(BaseModel):
+    plan_version: str
+    student_id: str
+    contract_version: str | None
+    evaluated_at: str
+    requirements: list[EligibilityRequirement]
+    missing: list[str]
+    eligible: bool
+
+
+class WindowEligibilityIn(BaseModel):
+    start: datetime
+    end: datetime
+
+    @model_validator(mode="after")
+    def _check_window(self) -> "WindowEligibilityIn":
+        if self.start.tzinfo is None or self.end.tzinfo is None:
+            raise ValueError("时间必须带时区")
+        if self.end <= self.start:
+            raise ValueError("end 必须晚于 start")
+        return self
+
+
+class WindowEligibilityOut(BaseModel):
+    plan_version: str
+    student_id: str
+    contract_version: str | None
+    status: str
+    missing: list[str]
+    covering: dict[str, Any]
+    window_start: str
+    window_end: str
+
+
+class RetroIn(BaseModel):
+    decision: Literal["approved", "denied"]
+    approver_id: str = Field(..., min_length=1, max_length=128)
+    reason: str = Field(..., min_length=1, max_length=512)
+
+
+class RetroOut(BaseModel):
+    plan_version: str
+    event_id: str
+    student_id: str
+    decision: str
+    approver_id: str
+    reason: str
+    revalidation: dict[str, Any]
+    created_at: str

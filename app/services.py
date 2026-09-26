@@ -7,6 +7,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from . import eligibility_services
 from .core.snapshot import Snapshot, build_snapshot, diff_snapshots, explain_student
 from .repository import (
     get_freeze,
@@ -74,24 +75,52 @@ def import_events(
     db: Session, *, plan_version: str, events: list[dict[str, Any]]
 ) -> dict[str, Any]:
     _require_plan(db, plan_version)
+    # 事件与资格快照在同一事务内提交，避免出现"事件已落库但缺项阻塞
+    # 快照缺失"的窗口期。
     accepted, duplicates = insert_events(
-        db, plan_version=plan_version, events=events
+        db, plan_version=plan_version, events=events, commit=False
     )
+    admissions_captured: list[str] = []
+    try:
+        accepted_set = set(accepted)
+        for e in events:
+            if e["event_id"] not in accepted_set or e["event_type"] != "checkin":
+                continue
+            payload = e["payload"]
+            result = eligibility_services.capture_event_admission(
+                db,
+                plan_version=plan_version,
+                event_id=e["event_id"],
+                student_id=e["student_id"],
+                activity_type=payload.get("activity_type", "regular"),
+                check_in_at=datetime.fromisoformat(payload["check_in_at"]),
+                check_out_at=datetime.fromisoformat(payload["check_out_at"]),
+                commit=False,
+            )
+            if result["created"]:
+                admissions_captured.append(e["event_id"])
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     return {
         "accepted": len(accepted),
         "duplicates": duplicates,
         "rejected": [],
+        "admissions_captured": admissions_captured,
     }
 
 
 def current_snapshot(db: Session, plan_version: str) -> Snapshot:
     plan = _require_plan(db, plan_version)
     events = load_events(db, plan_version)
+    admissions = eligibility_services.build_admission_map(db, plan_version)
     return build_snapshot(
         events,
         plan_version=plan_version,
         timezone_name=plan.iana_timezone,
         required_seconds=plan.required_seconds,
+        admissions=admissions,
     )
 
 
@@ -113,6 +142,7 @@ def freeze_semester(
 
     cutoff = max_event_id(db, plan_version)
     events = load_events(db, plan_version)
+    admissions = eligibility_services.build_admission_map(db, plan_version)
     snap = build_snapshot(
         events,
         plan_version=plan_version,
@@ -120,6 +150,7 @@ def freeze_semester(
         required_seconds=plan.required_seconds,
         freeze_id=freeze_id,
         event_cutoff_id=cutoff,
+        admissions=admissions,
     )
     row = insert_freeze(
         db,
